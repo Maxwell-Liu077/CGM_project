@@ -440,9 +440,10 @@ def merge_fragmented_streams(gas_data, subhalo_info, identity, count, BoxSize, m
 
 def precompute_morphology_ratios(gas_data, subhalo_info, identity, count, BoxSize):
     """
-    预计算所有候选流碎片的形态学长短轴比例。
-    此函数仅执行只读计算，不改变 identity 的状态。
-    为主控脚本提供形态学网格扫描所需的快速查询表，避免重复执行 O(N^2) 级别的 PCA 分解。
+    Pre-compute morphological axis ratios (a/b, a/c) for all candidate stream fragments.
+    This function performs read-only computation and does not modify the identity array.
+    Provides a fast lookup table for the master pipeline's morphology grid scan, avoiding
+    redundant O(N^2) PCA decomposition.
     """
     if count == 0:
         return np.zeros(0), np.zeros(0)
@@ -462,12 +463,12 @@ def precompute_morphology_ratios(gas_data, subhalo_info, identity, count, BoxSiz
     max_vol = np.max(clump_volumes)
     vol_threshold = 0.05 * max_vol
     
-    # 初始化形态学比例数组
+    # Initialize morphology ratio arrays
     axis_ratios_ab = np.zeros(count)
     axis_ratios_ac = np.zeros(count)
 
     for i in range(count):
-        # 预先过滤掉体积过小的碎片
+        # Pre-filter fragments with insufficient volume
         if clump_volumes[i] < vol_threshold:
             continue
             
@@ -475,15 +476,15 @@ def precompute_morphology_ratios(gas_data, subhalo_info, identity, count, BoxSiz
         clump_pos = pos[clump_mask]
         clump_mass = mass[clump_mask] 
         
-        # 将碎片坐标转换到以目标为中心的相对坐标系下
+        # Transform fragment coordinates to subhalo-centered relative frame
         dx = periodic_displacement(clump_pos, center_pos, BoxSize)
         clump_cen_masswt = np.average(dx, axis=0, weights=clump_mass)
         dx_centered = dx - clump_cen_masswt
         
-        # 质量加权协方差矩阵计算
+        # Mass-weighted covariance matrix
         cov_matrix = np.cov(dx_centered, rowvar=False, aweights=clump_mass)
         
-        # 特征值分解 (PCA)
+        # Eigenvalue decomposition (PCA)
         try:
             eigenvalues, _ = np.linalg.eigh(cov_matrix)
             eigenvalues = np.clip(eigenvalues, 0.0, None)
@@ -491,7 +492,7 @@ def precompute_morphology_ratios(gas_data, subhalo_info, identity, count, BoxSiz
         except np.linalg.LinAlgError:
             continue
             
-        # 防止奇异结构导致的除零错误
+        # Prevent division by zero from degenerate structures
         if eigenvalues[1] <= 1e-10 or eigenvalues[2] <= 1e-10:
             continue
             
