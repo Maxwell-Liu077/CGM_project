@@ -2,11 +2,11 @@ import numpy as np
 from scipy import signal
 from scipy import ndimage
 import itertools
-import copy
+import argparse
 import os
 import time
 
-# 导入底层核心计算库（假设底层计算库命名为 API_methods）
+# 导入底层核心计算库
 import API_methods as api
 
 # =========================================================================
@@ -21,13 +21,6 @@ def find_plateau_1d(x_values, y_values):
     1. 应用中值滤波 (scipy.signal.medfilt) 抹平离散的数值毛刺。
     2. 使用 itertools.groupby 寻找数值相同的连续区间。
     3. 返回最长连续区间的中点 x 值作为最稳定的参数选择。
-    
-    参数:
-        x_values (array-like): 参数空间的值 (例如 edge_tolerance 或 merge_fraction)。
-        y_values (array-like): 对应参数空间产生的冷流计数 (count)。
-        
-    返回:
-        float: 最优参数值。
     """
     x_values = np.asarray(x_values)
     y_values = np.asarray(y_values)
@@ -68,17 +61,10 @@ def find_plateau_2d(X_grid, Y_grid, Z_counts):
     二维平台搜索算法。
     
     逻辑:
-    1. 寻找二维空间中 Z_counts 最大的连通域 (scipy.ndimage.label)。
-    2. 对该最大连通域使用距离变换 (scipy.ndimage.distance_transform_edt)。
-    3. 寻找距离边界最远的像素点（即安全中心），将其映射回 (X, Y) 坐标。
-    
-    参数:
-        X_grid (2D array): 参数 X 的网格 (例如 thresh_ab)。
-        Y_grid (2D array): 参数 Y 的网格 (例如 thresh_ac)。
-        Z_counts (2D array): 各个参数组合下产生的冷流计数。
-        
-    返回:
-        tuple (float, float): 最优参数值 (best_X, best_Y)。
+    1. 应用轻量级二维中值滤波平滑物理孤立噪点，防止平台被切碎。
+    2. 寻找二维空间中 Z_counts 最大的连通域 (scipy.ndimage.label)。
+    3. 对该最大连通域使用距离变换 (scipy.ndimage.distance_transform_edt)。
+    4. 寻找距离边界最远的像素点（即安全中心），将其映射回 (X, Y) 坐标。
     """
     Z_counts = np.asarray(Z_counts)
     
@@ -87,8 +73,11 @@ def find_plateau_2d(X_grid, Y_grid, Z_counts):
         mid_y, mid_x = Z_counts.shape[0] // 2, Z_counts.shape[1] // 2
         return float(X_grid[mid_y, mid_x]), float(Y_grid[mid_y, mid_x])
         
+    # [优化] 使用中值滤波抹平微小的数值波动，提升形态学参数搜索鲁棒性
+    Z_smoothed = ndimage.median_filter(Z_counts, size=3)
+    
     # 提取所有大于0的独立 count 值
-    unique_counts = np.unique(Z_counts)
+    unique_counts = np.unique(Z_smoothed)
     unique_counts = unique_counts[unique_counts > 0]
     
     max_area = 0
@@ -97,7 +86,7 @@ def find_plateau_2d(X_grid, Y_grid, Z_counts):
     # 1. 遍历所有非零 count 值，寻找面积最大的连续等值“岛屿”
     for val in unique_counts:
         # 生成当前 count 值的二值化掩膜
-        binary_mask = (Z_counts == val)
+        binary_mask = (Z_smoothed == val)
         
         # 连通域分析
         labeled_array, num_features = ndimage.label(binary_mask)
@@ -120,7 +109,6 @@ def find_plateau_2d(X_grid, Y_grid, Z_counts):
     distance_map = ndimage.distance_transform_edt(best_label_mask)
     
     # 3. 寻找距离边界最远的安全中心 (即 distance_map 上的最大值点)
-    # np.argmax 返回的是展平后的索引，使用 unravel_index 转换回 2D 坐标 (row, col)
     center_y, center_x = np.unravel_index(np.argmax(distance_map), distance_map.shape)
     
     best_X = X_grid[center_y, center_x]
@@ -132,9 +120,7 @@ def find_plateau_2d(X_grid, Y_grid, Z_counts):
 # Pipeline Entrance: 主流水线装配
 # =========================================================================
 
-def adaptive_cold_stream_pipeline(subhalo_id, snapNum, catalogs, 
-                                  cutout_dir='/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_results/cutouts',
-                                  output_dir='/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_results/streams'):
+def adaptive_cold_stream_pipeline(subhalo_id, snapNum, catalogs, cutout_dir, output_dir):
     """
     序贯多尺度自适应冷流识别主控流水线。
     包含预处理、第一阶段（拓扑扫描）、第二阶段（合并扫描）和第三阶段（形态学扫描），
@@ -217,23 +203,30 @@ def adaptive_cold_stream_pipeline(subhalo_id, snapNum, catalogs,
         return api.extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs, output_dir, snapNum)
 
     # ---------------------------------------------------------------------
-    # Phase 3: Morphology (二维形态学过滤扫描)
+    # Phase 3: Morphology (二维形态学过滤扫描) [解耦与性能提升版]
     # ---------------------------------------------------------------------
     print("\n--- Phase 3: Morphology Scanning ---")
     # 构建 thresh_ab (X) 和 thresh_ac (Y) 的 2D 网格 (例如 10x10 的网格)
     ab_vals = np.linspace(1.2, 2.0, 10)
     ac_vals = np.linspace(2.0, 4.0, 10)
-    AB_grid, AC_grid = np.meshgrid(ab_vals, ac_vals)
+    
+    # [优化] 显式指定 indexing='ij'，防止非对称网格导致坐标轴翻转
+    AB_grid, AC_grid = np.meshgrid(ab_vals, ac_vals, indexing='ij')
     phase3_counts = np.zeros_like(AB_grid, dtype=int)
+    
+    # [性能核心优化]：循环外预计算所有碎片的PCA形态学比例，消除 O(N^2) 重复计算
+    ratios_ab, ratios_ac = api.precompute_morphology_ratios(
+        gas_data, subhalo_info, identity, count, BoxSize
+    )
     
     for i in range(AB_grid.shape[0]):
         for j in range(AB_grid.shape[1]):
-            # 同样必须传入 identity.copy() 隔离状态
-            _, cnt = api.filter_streams_morphology(
-                gas_data, subhalo_info, identity.copy(), count, BoxSize, 
-                thresh_ab=AB_grid[i, j], thresh_ac=AC_grid[i, j]
-            )
-            phase3_counts[i, j] = cnt
+            # 纯粹的轻量级掩码比较，极速算出当前参数下的存活冷流数量
+            ab_thresh = AB_grid[i, j]
+            ac_thresh = AC_grid[i, j]
+            
+            surviving_fragments = np.sum((ratios_ab > ab_thresh) & (ratios_ac > ac_thresh))
+            phase3_counts[i, j] = surviving_fragments
             
     best_ab, best_ac = find_plateau_2d(AB_grid, AC_grid, phase3_counts)
     print(f"[{subhalo_id}] Phase 3 Locked Best Morphology -> ab: {best_ab:.2f}, ac: {best_ac:.2f}")
@@ -262,25 +255,36 @@ def adaptive_cold_stream_pipeline(subhalo_id, snapNum, catalogs,
 # 脚本执行入口
 # =========================================================================
 if __name__ == "__main__":
-    # 示例调用
-    # 实际应用中，您可以在这里解析 argparse 或读取子晕列表循环执行
+    # [优化] 引入 argparse 取代硬编码的绝对路径，增强脚本的可移植性和批处理友好性
+    parser = argparse.ArgumentParser(description="Adaptive Cold Stream Identification Pipeline")
     
-    # 假定运行参数
-    basePath = '/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_data' # Illustris/TNG 数据路径
-    snapNum = 99
-    subhalo_id_to_test = 0  # 替换为目标 Subhalo ID
+    # 设置默认值为您原来的路径，保证不加任何参数时也能向后兼容直接运行
+    parser.add_argument("--basePath", type=str, 
+                        default='/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_data',
+                        help="Illustris/TNG data base path")
+    parser.add_argument("--cutout_dir", type=str, 
+                        default='/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_results/cutouts',
+                        help="Directory containing HDF5 cutout files")
+    parser.add_argument("--output_dir", type=str, 
+                        default='/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_results/streams',
+                        help="Directory to save final stream property files")
+    parser.add_argument("--snapNum", type=int, default=99, help="Snapshot number")
+    parser.add_argument("--subhalo_id", type=int, default=0, help="Target Subhalo ID")
     
+    args = parser.parse_args()
+
     print("Loading global catalogs... (this may take a while)")
     try:
-        # 需要确保 api.load_catalogs 能够正确访问 basePath
-        catalogs = api.load_catalogs(basePath, snapNum)
+        catalogs = api.load_catalogs(args.basePath, args.snapNum)
         print("Catalogs loaded successfully.")
         
-        # 运行自适应识别流
+        # 运行自适应识别流水线
         adaptive_cold_stream_pipeline(
-            subhalo_id=subhalo_id_to_test, 
-            snapNum=snapNum, 
-            catalogs=catalogs
+            subhalo_id=args.subhalo_id, 
+            snapNum=args.snapNum, 
+            catalogs=catalogs,
+            cutout_dir=args.cutout_dir,
+            output_dir=args.output_dir
         )
     except Exception as e:
         print(f"Failed to run pipeline: {e}")
