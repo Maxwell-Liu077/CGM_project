@@ -1,16 +1,17 @@
 """
-冷流 3D 可视化 — Scientific Visualization Skill 优化版
+冷流 2D 投影可视化 — Scientific Visualization Skill 优化版
 
 优化点:
-  - 期刊级排版 (double-column 尺寸, Arial sans-serif 字体)
-  - 色盲友好配色 (magma 已是 perceptually uniform, 保留)
-  - 更高分辨率的 virial 球壳 (40j×20j vs 20j×10j)
-  - 透明凸包 + 线框风格, 减少视觉遮挡
-  - 导出 PDF + PNG 双格式, 300 DPI
+  - 双栏宽度 (7.08 inch), 面板间距优化
+  - 期刊级排版: sans-serif 字体, 统一字号
+  - 色盲安全配色: Okabe-Ito 用于 legend, magma 用于温度映射
+  - 凸包轮廓使用 steelblue (而非 lightblue), 提高对比度
+  - 去除多余网格线, 减少 chart junk
+  - 导出 PDF + PNG 双格式
 
 Usage:
-    python plot_cold_streams_3d_opt.py --subhalo 59075 --snap 33
-    python plot_cold_streams_3d_opt.py --demo  # 使用合成数据演示
+    python plot_cold_streams_2d_opt.py --subhalo 59075 --snap 33
+    python plot_cold_streams_2d_opt.py --demo  # 使用合成数据演示
 """
 
 import os
@@ -24,12 +25,17 @@ from matplotlib.ticker import LogLocator, LogFormatterSciNotation
 import matplotlib.cm as cm
 from scipy.spatial import ConvexHull
 
-# ── 期刊级样式 (自包含, 不依赖 skill) ──
+# ── 引入 Scientific Visualization Skill 的辅助模块 ──
+SKILL_DIR = os.path.expanduser("~/.claude/skills/scientific-visualization")
+sys.path.insert(0, os.path.join(SKILL_DIR, "scripts"))
+from style_presets import apply_publication_style
+from figure_export import save_publication_figure
+
+# ── 期刊级样式 ──
+apply_publication_style('default')
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 plt.rcParams['image.cmap'] = 'magma'
-
-# 保留天文领域常用的 serif 字体用于数学公式
 plt.rcParams['mathtext.fontset'] = 'dejavusans'
 
 
@@ -100,28 +106,23 @@ def generate_synthetic_data(n_streams=2, n_cells_per_stream=2000, rvir=800.0, bo
     data['ab_ratios'] = np.array([0.3, 0.5])
     data['ac_ratios'] = np.array([0.2, 0.4])
 
-    all_pos, all_temp, all_offsets, all_lengths = [], [], [], []
-    offset = 0
-
-    # Stream 1: 沿 XZ 平面进入的准直流
     t = np.linspace(0.1, 1.0, n_cells_per_stream)
     stream1_x = -rvir * 0.8 + 1.2 * rvir * t + np.random.randn(n_cells_per_stream) * 40
     stream1_y = np.random.randn(n_cells_per_stream) * 60 * (1 - 0.5 * t)
     stream1_z = rvir * 0.3 * np.sin(2 * np.pi * t) + np.random.randn(n_cells_per_stream) * 40
-    temp1 = 5e3 + 1.5e5 * np.random.beta(2, 5, n_cells_per_stream)
 
-    # Stream 2: 从另一侧螺旋进入
     theta = np.linspace(0, 3 * np.pi, n_cells_per_stream)
     r2 = rvir * (1.0 - 0.6 * t)
     stream2_x = r2 * np.cos(theta) + np.random.randn(n_cells_per_stream) * 50
     stream2_y = r2 * np.sin(theta) + np.random.randn(n_cells_per_stream) * 50
     stream2_z = rvir * (0.5 - t) * 0.4 + np.random.randn(n_cells_per_stream) * 35
-    temp2 = 5e3 + 1.8e5 * np.random.beta(2, 4, n_cells_per_stream)
 
     all_pos = np.vstack([
         np.column_stack([stream1_x, stream1_y, stream1_z]),
         np.column_stack([stream2_x, stream2_y, stream2_z]),
     ])
+    temp1 = 5e3 + 1.5e5 * np.random.beta(2, 5, n_cells_per_stream)
+    temp2 = 5e3 + 1.8e5 * np.random.beta(2, 4, n_cells_per_stream)
     all_temp = np.concatenate([temp1, temp2])
 
     data['cell_inds'] = np.arange(len(all_pos))
@@ -135,25 +136,23 @@ def generate_synthetic_data(n_streams=2, n_cells_per_stream=2000, rvir=800.0, bo
 
 
 # ============================================================================
-# 3D 优化主函数
+# 2D 优化主函数
 # ============================================================================
-def plot_cold_streams_3d(data, snapNum, subhalo_id, boxSize=35000.0,
-                         save_path=None, show_hull=True, hull_alpha=0.06):
+def plot_cold_streams_2d(data, snapNum, subhalo_id, boxSize=35000.0,
+                         save_path=None, show_hull=True, hull_linewidth=1.0):
     """
-    期刊级 3D 冷流散点图
+    期刊级 2D 冷流投影图 (XY / XZ / YZ)
 
     优化:
-      - 双栏尺寸 (7.08 inch / 180 mm)
-      - 高分辨率球壳 (40j×20j)
-      - 浅蓝色半透明凸包 (降低 alpha, 减少遮挡)
-      - Okabe-Ito 色盲安全 legend
-      - 矢量 PDF + PNG 双导出
+      - 双栏宽度 (7.08 inch), 3 面板均匀分布
+      - 去除顶部/右侧 spines, 减少 chart junk
+      - 凸包使用 steelblue 实色 (对比度优于 lightblue)
+      - Virial 环使用色盲安全色 (blue/orange)
+      - 共享 colorbar 统一比例
+      - 面板标签 (A/B/C) 用于论文引用
     """
     dx = periodic_displacement(data['stream_pos'], data['center_pos'], boxSize)
-
-    # 双栏宽度, 高度按黄金比例
-    fig = plt.figure(figsize=(7.08, 5.5))
-    ax = fig.add_subplot(111, projection='3d')
+    rvir = data['r200c']
 
     norm = LogNorm(vmin=5e3, vmax=2.5e5)
     cmap = plt.get_cmap('magma')
@@ -161,102 +160,95 @@ def plot_cold_streams_3d(data, snapNum, subhalo_id, boxSize=35000.0,
     okabe_ito_colors = ['#E69F00', '#56B4E9', '#009E73', '#F0E442',
                         '#0072B2', '#D55E00', '#CC79A7']
 
-    for i in range(data['count']):
-        loc = slice(data['offsets'][i], data['offsets'][i] + data['lengths'][i])
-        clump_dx = dx[loc]
-        clump_temp = data['stream_temp'][loc]
-        color = okabe_ito_colors[i % len(okabe_ito_colors)]
+    planes = [
+        {'axes': (0, 1), 'label_x': r'X (kpc/$h$)', 'label_y': r'Y (kpc/$h$)', 'panel': 'A'},
+        {'axes': (0, 2), 'label_x': r'X (kpc/$h$)', 'label_y': r'Z (kpc/$h$)', 'panel': 'B'},
+        {'axes': (1, 2), 'label_x': r'Y (kpc/$h$)', 'label_y': r'Z (kpc/$h$)', 'panel': 'C'},
+    ]
 
-        ab = data['ab_ratios'][i]
-        ac = data['ac_ratios'][i]
-        if ab > 0 and ac > 0:
-            label_str = f"Stream {i+1} (a/b={ab:.2f}, a/c={ac:.2f})"
-        elif ab > 0:
-            label_str = f"Stream {i+1} (a/b={ab:.2f})"
-        else:
-            label_str = f"Stream {i+1}"
+    # 双栏宽度, 高度约 1:1 比例 (禁用 constrained_layout 以使用 subplots_adjust)
+    plt.rcParams['figure.constrained_layout.use'] = False
+    fig, axes = plt.subplots(1, 3, figsize=(7.08, 2.4))
+    fig.subplots_adjust(wspace=0.25, bottom=0.15, top=0.88)
 
-        ax.scatter(
-            clump_dx[:, 0], clump_dx[:, 1], clump_dx[:, 2],
-            s=1.5, alpha=0.6, c=clump_temp,
-            cmap=cmap, norm=norm,
-            label=label_str, edgecolors='none', rasterized=True,
-        )
+    for ax, plane in zip(axes, planes):
+        ix, iy = plane['axes']
 
-    # 凸包包裹面 — 降低透明度, 避免遮挡内部结构
-    if show_hull:
         for i in range(data['count']):
             loc = slice(data['offsets'][i], data['offsets'][i] + data['lengths'][i])
-            pts = dx[loc]
-            if len(pts) >= 4:
+            clump_temp = data['stream_temp'][loc]
+            color = okabe_ito_colors[i % len(okabe_ito_colors)]
+
+            label_str = f"Stream {i+1}"
+
+            ax.scatter(
+                dx[loc, ix], dx[loc, iy],
+                s=1.5, alpha=0.55, c=clump_temp,
+                cmap=cmap, norm=norm,
+                label=label_str, edgecolors='none', rasterized=True,
+            )
+
+            # 凸包包裹线
+            if show_hull and len(dx[loc]) >= 3:
                 try:
-                    hull = ConvexHull(pts)
-                    ax.plot_trisurf(
-                        pts[:, 0], pts[:, 1], pts[:, 2],
-                        triangles=hull.simplices,
-                        color='lightblue', alpha=hull_alpha,
-                        edgecolor='steelblue', linewidth=0.4,
-                        antialiased=True,
-                    )
+                    pts_2d = dx[loc, [ix, iy]]
+                    hull2d = ConvexHull(pts_2d)
+                    hull_pts = pts_2d[hull2d.vertices]
+                    hull_closed = np.vstack([hull_pts, hull_pts[0]])
+                    ax.plot(hull_closed[:, 0], hull_closed[:, 1],
+                            color='#4682B4', linestyle='--', linewidth=hull_linewidth,
+                            alpha=0.7, zorder=3)
                 except Exception:
                     pass
 
-    rvir = data['r200c']
+        # Virial 半径环 — 使用色盲安全色
+        circle_vir = plt.Circle((0, 0), rvir, color='#0072B2', fill=False,
+                                linestyle='-', linewidth=0.8, alpha=0.35, zorder=4)
+        circle_inner = plt.Circle((0, 0), 0.15 * rvir, color='#D55E00', fill=False,
+                                  linestyle='-', linewidth=0.8, alpha=0.35, zorder=4)
+        ax.add_patch(circle_vir)
+        ax.add_patch(circle_inner)
 
-    # 高分辨率 virial 球壳
-    u, v = np.mgrid[0:2*np.pi:40j, 0:np.pi:20j]
-    shells = [
-        {'r': 0.15 * rvir, 'color': '#D55E00', 'alpha': 0.15, 'label': r'$0.15\,R_{\rm vir}$'},
-        {'r': rvir,        'color': '#0072B2', 'alpha': 0.10, 'label': r'$R_{\rm vir}$'},
+        ax.set_xlim(-rvir, rvir)
+        ax.set_ylim(-rvir, rvir)
+        ax.set_xlabel(plane['label_x'], fontsize=8)
+        ax.set_ylabel(plane['label_y'], fontsize=8)
+        ax.set_aspect('equal')
+        ax.tick_params(labelsize=7)
+
+        # 去除顶部/右侧 spines
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # 面板标签
+        ax.text(-0.08, 1.02, plane['panel'], transform=ax.transAxes,
+                fontsize=9, fontweight='bold', va='top')
+
+    # Legend (只含 stream 标签)
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=okabe_ito_colors[i % len(okabe_ito_colors)],
+                   markersize=5, alpha=0.7, label=f"Stream {i+1}")
+        for i in range(data['count'])
     ]
-    for shell in shells:
-        x_s = shell['r'] * np.cos(u) * np.sin(v)
-        y_s = shell['r'] * np.sin(u) * np.sin(v)
-        z_s = shell['r'] * np.cos(v)
-        ax.plot_wireframe(
-            x_s, y_s, z_s,
-            color=shell['color'], alpha=shell['alpha'],
-            linewidth=0.5, label=shell['label'],
-        )
+    legend_elements.append(plt.Line2D([0], [0], color='#0072B2', linewidth=1.2, label=r'$R_{\rm vir}$'))
+    legend_elements.append(plt.Line2D([0], [0], color='#D55E00', linewidth=1.2, label=r'$0.15\,R_{\rm vir}$'))
+    axes[0].legend(handles=legend_elements, loc='upper left', fontsize=7,
+                   framealpha=0.85, frameon=True, edgecolor='lightgray')
 
-    limit = rvir
-    ax.set_xlim([-limit, limit])
-    ax.set_ylim([-limit, limit])
-    ax.set_zlim([-limit, limit])
-
-    ax.set_xlabel(r'X (kpc/$h$)', labelpad=8, fontsize=9)
-    ax.set_ylabel(r'Y (kpc/$h$)', labelpad=8, fontsize=9)
-    ax.set_zlabel(r'Z (kpc/$h$)', labelpad=8, fontsize=9)
-
-    ax.tick_params(labelsize=7)
-
-    # 清除面板背景
-    ax.xaxis.pane.fill = False
-    ax.yaxis.pane.fill = False
-    ax.zaxis.pane.fill = False
-    ax.xaxis.pane.set_edgecolor('lightgray')
-    ax.yaxis.pane.set_edgecolor('lightgray')
-    ax.zaxis.pane.set_edgecolor('lightgray')
-    ax.grid(color='lightgray', linestyle=':', alpha=0.3, linewidth=0.5)
-
-    # Colorbar
+    # 共享 colorbar
     sm = cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.08, shrink=0.7)
-    cbar.set_label(r'Gas Temperature $T$ (K)', rotation=270, labelpad=15, fontsize=9)
+    cbar = fig.colorbar(sm, ax=axes, fraction=0.02, pad=0.04, shrink=0.85)
+    cbar.set_label(r'Gas Temperature $T$ (K)', rotation=270, labelpad=12, fontsize=8)
     cbar.ax.tick_params(labelsize=7)
     cbar.locator = LogLocator(base=10.0, numticks=5)
     cbar.formatter = LogFormatterSciNotation(10.0)
     cbar.update_ticks()
 
-    ax.legend(loc='upper left', fontsize=7.5, framealpha=0.85, frameon=True,
-              edgecolor='lightgray')
-
     # 导出
     if save_path:
         base = os.path.splitext(save_path)[0]
-        fig.savefig(base + ".pdf", dpi=300, bbox_inches="tight")
-        fig.savefig(base + ".png", dpi=300, bbox_inches="tight")
+        save_publication_figure(fig, base, formats=['pdf', 'png'], dpi=300)
     else:
         plt.show()
 
@@ -268,7 +260,7 @@ def plot_cold_streams_3d(data, snapNum, subhalo_id, boxSize=35000.0,
 # 入口
 # ============================================================================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="冷流 3D 可视化 (优化版)")
+    parser = argparse.ArgumentParser(description="冷流 2D 投影可视化 (优化版)")
     parser.add_argument("--subhalo", type=int, default=59075)
     parser.add_argument("--snap", type=int, default=33)
     parser.add_argument("--cutout_dir", type=str,
@@ -287,8 +279,8 @@ if __name__ == "__main__":
         print("Generating synthetic cold stream data for demo...")
         data = generate_synthetic_data()
         print(f"  {data['count']} streams, {len(data['cell_inds'])} cells total")
-        save_path = os.path.join(output_dir, "cold_streams_3d_demo.pdf")
-        plot_cold_streams_3d(data, snapNum=33, subhalo_id=0, boxSize=args.box_size, save_path=save_path)
+        save_path = os.path.join(output_dir, "cold_streams_2d_demo.pdf")
+        plot_cold_streams_2d(data, snapNum=33, subhalo_id=0, boxSize=args.box_size, save_path=save_path)
     else:
         print(f"Loading data for Subhalo {args.subhalo}, Snap {args.snap}...")
         data = load_stream_data(args.subhalo, args.snap, args.cutout_dir, args.stream_dir)
@@ -296,7 +288,7 @@ if __name__ == "__main__":
             print(f"No cold streams found for Subhalo {args.subhalo} (Snap {args.snap}).")
             exit(0)
         print(f"Found {data['count']} cold stream(s), {len(data['cell_inds'])} gas cells total.")
-        save_path = os.path.join(output_dir, f"cold_streams_3d_sh{args.subhalo}_snap{args.snap}.pdf")
-        plot_cold_streams_3d(data, args.snap, args.subhalo, args.box_size, save_path=save_path)
+        save_path = os.path.join(output_dir, f"cold_streams_2d_sh{args.subhalo}_snap{args.snap}.pdf")
+        plot_cold_streams_2d(data, args.snap, args.subhalo, args.box_size, save_path=save_path)
 
     print("Done.")

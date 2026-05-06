@@ -392,195 +392,79 @@ def _get_surviving_gas_props(gas_data, valid_indices):
     return pos, mass, vol
 
 def merge_fragmented_streams(gas_data, subhalo_info, identity, count, BoxSize, merge_fraction=0.02):
-    """Merge spatially close stream fragments using KDTree"""
+    """Merge spatially close stream fragments using centroid-based KDTree query."""
     if count <= 1:
         return identity, count
-        
+
     print(f"[{subhalo_info['subhalo_id']}] Merging fragmented streams, initial components: {count}")
-    
+
     valid_mask = identity >= 0
     valid_indices = np.where(valid_mask)[0]
-    
+
     if len(valid_indices) == 0:
         return identity, 0
-        
+
     pos = gas_data['Coordinates'][valid_indices]
     local_identities = identity[valid_indices]
-    
+
     r200c = subhalo_info['r200c']
     tol = merge_fraction * r200c
     print(f"Merge tolerance: {tol:.2f} kpc/h ({merge_fraction*100:.1f}% R200c)")
-    
-    trees = []
+
+    # Compute centroid per component
+    centers = np.zeros((count, 3))
     for i in range(count):
-        clump_pos = pos[local_identities == i] % BoxSize
-        trees.append(cKDTree(clump_pos, boxsize=BoxSize))
-        
-    adj_matrix = np.zeros((count, count), dtype=int)
-    
+        centers[i] = np.mean(pos[local_identities == i] % BoxSize, axis=0)
+
+    # Single KDTree + query_pairs: O(count log count) instead of O(count^2 * n_particles)
+    tree = cKDTree(centers, boxsize=BoxSize)
+    pairs = tree.query_pairs(r=tol)
+
+    # Union-Find
+    parent = np.arange(count)
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for a, b in pairs:
+        union(a, b)
+
+    # Relabel components
+    new_labels = np.zeros(count, dtype=np.int32)
+    mapping = {}
+    next_label = 0
     for i in range(count):
-        for j in range(i + 1, count):
-            sdm = trees[i].sparse_distance_matrix(trees[j], max_distance=tol)
-            if sdm.nnz > 0:
-                adj_matrix[i, j] = 1
-                adj_matrix[j, i] = 1
-                
-    csr_adj = csr_matrix(adj_matrix)
-    n_components, new_labels = connected_components(csr_adj, directed=False)
-    
+        root = find(i)
+        if root not in mapping:
+            mapping[root] = next_label
+            next_label += 1
+        new_labels[i] = mapping[root]
+
+    n_components = next_label
+
     if n_components == count:
         print("No fragments merged")
         return identity, count
     else:
         print(f"Merging complete: {count} fragments merged into {n_components} continuous structures")
-        
+
     identity[valid_indices] = new_labels[local_identities]
-    
+
     return identity, n_components
-
-def precompute_morphology_ratios(gas_data, subhalo_info, identity, count, BoxSize):
-    """
-    Pre-compute morphological axis ratios (a/b, a/c) for all candidate stream fragments.
-    This function performs read-only computation and does not modify the identity array.
-    Provides a fast lookup table for the master pipeline's morphology grid scan, avoiding
-    redundant O(N^2) PCA decomposition.
-    """
-    if count == 0:
-        return np.zeros(0), np.zeros(0)
-        
-    valid_mask = identity >= 0
-    valid_indices = np.where(valid_mask)[0]
-    
-    if len(valid_indices) == 0:
-        return np.zeros(0), np.zeros(0)
-        
-    pos, mass, vol = _get_surviving_gas_props(gas_data, valid_indices)
-    local_identities = identity[valid_indices]
-    
-    center_pos = subhalo_info['center_pos']
-    
-    clump_volumes = np.bincount(local_identities, weights=vol, minlength=count)
-    max_vol = np.max(clump_volumes)
-    vol_threshold = 0.05 * max_vol
-    
-    # Initialize morphology ratio arrays
-    axis_ratios_ab = np.zeros(count)
-    axis_ratios_ac = np.zeros(count)
-
-    for i in range(count):
-        # Pre-filter fragments with insufficient volume
-        if clump_volumes[i] < vol_threshold:
-            continue
-            
-        clump_mask = (local_identities == i)
-        clump_pos = pos[clump_mask]
-        clump_mass = mass[clump_mask] 
-        
-        # Transform fragment coordinates to subhalo-centered relative frame
-        dx = periodic_displacement(clump_pos, center_pos, BoxSize)
-        clump_cen_masswt = np.average(dx, axis=0, weights=clump_mass)
-        dx_centered = dx - clump_cen_masswt
-        
-        # Mass-weighted covariance matrix
-        cov_matrix = np.cov(dx_centered, rowvar=False, aweights=clump_mass)
-        
-        # Eigenvalue decomposition (PCA)
-        try:
-            eigenvalues, _ = np.linalg.eigh(cov_matrix)
-            eigenvalues = np.clip(eigenvalues, 0.0, None)
-            eigenvalues = np.sort(eigenvalues)[::-1]
-        except np.linalg.LinAlgError:
-            continue
-            
-        # Prevent division by zero from degenerate structures
-        if eigenvalues[1] <= 1e-10 or eigenvalues[2] <= 1e-10:
-            continue
-            
-        a = np.sqrt(eigenvalues[0])
-        b = np.sqrt(eigenvalues[1])
-        c = np.sqrt(eigenvalues[2])
-        
-        axis_ratios_ab[i] = a / b
-        axis_ratios_ac[i] = a / c
-        
-    return axis_ratios_ab, axis_ratios_ac
-
-def filter_streams_morphology(gas_data, subhalo_info, identity, count, BoxSize, thresh_ab, thresh_ac):
-    """Filter streams based on PCA morphology and shape tensor analysis"""
-    if count == 0:
-        return identity, 0
-        
-    print(f"[{subhalo_info['subhalo_id']}] Performing PCA morphology and shape tensor analysis")
-    
-    valid_mask = identity >= 0
-    valid_indices = np.where(valid_mask)[0]
-    
-    if len(valid_indices) == 0:
-        return identity, 0
-        
-    pos, mass, vol = _get_surviving_gas_props(gas_data, valid_indices)
-    local_identities = identity[valid_indices]
-    
-    center_pos = subhalo_info['center_pos']
-    r200c = subhalo_info['r200c']
-    
-    clump_volumes = np.bincount(local_identities, weights=vol, minlength=count)
-    max_vol = np.max(clump_volumes)
-    vol_threshold = 0.05 * max_vol
-    print(f"Max component volume: {max_vol:.2e} [kpc/h]^3, volume threshold: {vol_threshold:.2e} [kpc/h]^3")
-
-    surviving_ids = []
-
-    for i in range(count):
-        if clump_volumes[i] < vol_threshold:
-            continue
-            
-        clump_mask = (local_identities == i)
-        clump_pos = pos[clump_mask]
-        clump_mass = mass[clump_mask] 
-        
-        dx = periodic_displacement(clump_pos, center_pos, BoxSize)
-        clump_cen_masswt = np.average(dx, axis=0, weights=clump_mass)
-        dx_centered = dx - clump_cen_masswt
-        
-        cov_matrix = np.cov(dx_centered, rowvar=False, aweights=clump_mass)
-        
-        try:
-            eigenvalues, _ = np.linalg.eigh(cov_matrix)
-            eigenvalues = np.clip(eigenvalues, 0.0, None)
-            eigenvalues = np.sort(eigenvalues)[::-1]
-        except np.linalg.LinAlgError:
-            continue
-            
-        if eigenvalues[1] <= 1e-10 or eigenvalues[2] <= 1e-10:
-            continue
-            
-        a = np.sqrt(eigenvalues[0])
-        b = np.sqrt(eigenvalues[1])
-        c = np.sqrt(eigenvalues[2])
-        
-        axis_ratio_ab = a / b
-        axis_ratio_ac = a / c
-        
-        if axis_ratio_ab > thresh_ab and axis_ratio_ac > thresh_ac:
-            surviving_ids.append(i)
-
-    print(f"Morphology filtering complete: retained {len(surviving_ids)} filament-like structures")
-
-    c_map = np.zeros(count, dtype=np.int32) - 1
-    if len(surviving_ids) > 0:
-        c_map[surviving_ids] = np.arange(len(surviving_ids))
-        
-    identity[valid_indices] = c_map[local_identities]
-    new_count = len(surviving_ids)
-    
-    return identity, new_count
 
 def extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs, output_dir, snapNum):
     """Extract and save physical properties of validated cold streams"""
     os.makedirs(output_dir, exist_ok=True)
     saveFilename = os.path.join(output_dir, f"cold_streams_snap{snapNum:03d}_sh{subhalo_info['subhalo_id']}.hdf5")
-    
+
     if count == 0:
         print(f"[{subhalo_info['subhalo_id']}] No cold streams detected, writing placeholder file")
         with h5py.File(saveFilename, "w") as f:
@@ -591,14 +475,14 @@ def extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs,
     print(f"[{subhalo_info['subhalo_id']}] Extracting properties for {count} cold streams")
     start_time = time.time()
     BoxSize = catalogs['BoxSize']
-    
+
     valid_indices = np.where(identity >= 0)[0]
     local_identities = identity[valid_indices]
-    
+
     lengths = np.bincount(local_identities, minlength=count)
     sort_idx = np.argsort(local_identities, kind="mergesort")
-    cell_inds = valid_indices[sort_idx] 
-    
+    cell_inds = valid_indices[sort_idx]
+
     offsets = np.zeros(count, dtype="int32")
     offsets[1:] = np.cumsum(lengths)[:-1]
 
@@ -608,17 +492,17 @@ def extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs,
     dens = gas_data['nH'][cell_inds]
     temp = gas_data['Temperature'][cell_inds]
     vel_phys = gas_data['PhysicalVelocity'][cell_inds]
-    metal = gas_data['GFM_Metallicity'][cell_inds] / 0.0127 
-    
+    metal = gas_data['GFM_Metallicity'][cell_inds] / 0.0127
+
     center_pos = subhalo_info['center_pos']
     center_vel = subhalo_info['center_vel']
-    
+
     vrel = vel_phys - center_vel
     dx = periodic_displacement(pos, center_pos, BoxSize)
     dist_all = np.linalg.norm(dx, axis=-1)
     dist_all = np.clip(dist_all, 1e-5, None)
     vrad = np.sum(vrel * dx, axis=1) / dist_all
-    
+
     props = {
         "count": np.array([count], dtype="int32"),
         "vol": np.zeros(count, dtype="float32"),
@@ -627,15 +511,15 @@ def extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs,
         "temp_mean": np.zeros(count, dtype="float32"),
         "metal_mean": np.zeros(count, dtype="float32"),
         "vrad_mean": np.zeros(count, dtype="float32"),
-        "cen": np.zeros((count, 3), dtype="float32"),         
-        "cen_masswt": np.zeros((count, 3), dtype="float32"),  
-        "vrel_masswt": np.zeros((count, 3), dtype="float32"), 
+        "cen": np.zeros((count, 3), dtype="float32"),
+        "cen_masswt": np.zeros((count, 3), dtype="float32"),
+        "vrel_masswt": np.zeros((count, 3), dtype="float32"),
         "vrel_denswt": np.zeros((count, 3), dtype="float32"),
     }
 
     for i in range(count):
         loc = slice(offsets[i], offsets[i] + lengths[i])
-        
+
         props["vol"][i] = vol[loc].sum()
         props["mass"][i] = mass[loc].sum()
         props["dens_mean"][i] = dens[loc].mean()
@@ -645,10 +529,10 @@ def extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs,
 
         avg_dx = np.average(dx[loc, :], axis=0)
         avg_dx_masswt = np.average(dx[loc, :], axis=0, weights=mass[loc])
-        
+
         props["cen"][i, :] = (center_pos + avg_dx) % BoxSize
         props["cen_masswt"][i, :] = (center_pos + avg_dx_masswt) % BoxSize
-        
+
         props["vrel_masswt"][i, :] = np.average(vrel[loc, :], axis=0, weights=mass[loc])
         props["vrel_denswt"][i, :] = np.average(vrel[loc, :], axis=0, weights=dens[loc])
 
@@ -668,13 +552,15 @@ def extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs,
         f.attrs["R200c"] = subhalo_info['r200c']
         f.attrs["ScaleFactor"] = catalogs['a']
         f.attrs["Mvir"] = subhalo_info['m_vir']
-        
-        for key in objects: f["objects/%s" % key] = objects[key]
-        for key in props: f["props/%s" % key] = props[key]
+
+        for key in objects:
+            f["objects/%s" % key] = objects[key]
+        for key in props:
+            f["props/%s" % key] = props[key]
 
     print(f"Data saved to: {saveFilename}")
     print(f"Property extraction complete: {time.time()-start_time:.2f}s")
-    
+
     return objects, props
 
 # =========================================================================

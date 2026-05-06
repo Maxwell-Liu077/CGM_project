@@ -133,33 +133,41 @@ def plot_cold_streams_2d(data, snapNum, subhalo_id, boxSize=35000.0, save_path=N
     for ax, plane in zip(axes, planes):
         ix, iy = plane['axes']
 
-        for i in range(data['count']):
-            loc = slice(data['offsets'][i], data['offsets'][i] + data['lengths'][i])
-            clump_temp = data['stream_temp'][loc]
-
-            ab = data['ab_ratios'][i]
-            ac = data['ac_ratios'][i]
-            label_str = f"Stream {i+1} (a/b={ab:.1f}, a/c={ac:.1f})" if ab > 0 and ac > 0 else f"Stream {i+1} (a/b={ab:.1f})" if ab > 0 else f"Stream {i+1}"
-
+        if data['count'] > 100:
             ax.scatter(
-                dx[loc, ix], dx[loc, iy],
-                s=1.2, alpha=0.5, c=clump_temp,
+                dx[:, ix], dx[:, iy],
+                s=1.2, alpha=0.5, c=data['stream_temp'],
                 cmap=cmap, norm=norm,
-                label=label_str, edgecolors='none', rasterized=True,
+                label=f"{data['count']} cold streams", edgecolors='none', rasterized=True,
             )
+        else:
+            for i in range(data['count']):
+                loc = slice(data['offsets'][i], data['offsets'][i] + data['lengths'][i])
+                clump_temp = data['stream_temp'][loc]
 
-            # 每条 Stream 分别绘制凸包包裹线 (2D 投影)
-            if show_hull and len(dx[loc]) >= 3:
-                try:
-                    pts_2d = dx[loc, [ix, iy]]
-                    hull2d = ConvexHull(pts_2d)
-                    hull_pts = pts_2d[hull2d.vertices]
-                    hull_closed = np.vstack([hull_pts, hull_pts[0]])
-                    ax.plot(hull_closed[:, 0], hull_closed[:, 1],
-                            color='lightblue', linestyle='--', linewidth=hull_linewidth,
-                            alpha=0.85, zorder=3)
-                except Exception:
-                    pass
+                ab = data['ab_ratios'][i]
+                ac = data['ac_ratios'][i]
+                label_str = f"Stream {i+1} (a/b={ab:.1f}, a/c={ac:.1f})" if ab > 0 and ac > 0 else f"Stream {i+1} (a/b={ab:.1f})" if ab > 0 else f"Stream {i+1}"
+
+                ax.scatter(
+                    dx[loc, ix], dx[loc, iy],
+                    s=1.2, alpha=0.5, c=clump_temp,
+                    cmap=cmap, norm=norm,
+                    label=label_str, edgecolors='none', rasterized=True,
+                )
+
+                # Convex hull per stream (only for small counts)
+                if show_hull and len(dx[loc]) >= 3:
+                    try:
+                        pts_2d = dx[loc, [ix, iy]]
+                        hull2d = ConvexHull(pts_2d)
+                        hull_pts = pts_2d[hull2d.vertices]
+                        hull_closed = np.vstack([hull_pts, hull_pts[0]])
+                        ax.plot(hull_closed[:, 0], hull_closed[:, 1],
+                                color='lightblue', linestyle='--', linewidth=hull_linewidth,
+                                alpha=0.85, zorder=3)
+                    except Exception:
+                        pass
 
         # virial 半径圆环
         circle_vir = plt.Circle((0, 0), rvir, color='darkblue', fill=False,
@@ -177,10 +185,13 @@ def plot_cold_streams_2d(data, snapNum, subhalo_id, boxSize=35000.0, save_path=N
         ax.set_aspect('equal')
         ax.grid(True, linestyle=':', alpha=0.3)
 
-    # 只在第一个面板显示 legend
-    handles, labels = axes[0].get_legend_handles_labels()
-    axes[0].legend(handles[:data['count']], labels[:data['count']],
-                   loc='upper left', fontsize=7, framealpha=0.8)
+    # Legend
+    if data['count'] > 100:
+        axes[0].legend(loc='upper left', fontsize=7, framealpha=0.8)
+    else:
+        handles, labels = axes[0].get_legend_handles_labels()
+        axes[0].legend(handles[:data['count']], labels[:data['count']],
+                       loc='upper left', fontsize=7, framealpha=0.8)
 
     # 共享 colorbar
     sm = cm.ScalarMappable(cmap=cmap, norm=norm)

@@ -126,42 +126,51 @@ def plot_cold_streams_3d(data, snapNum, subhalo_id, boxSize=35000.0,
     sm = cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
 
-    for i in range(data['count']):
-        loc = slice(data['offsets'][i], data['offsets'][i] + data['lengths'][i])
-        clump_dx = dx[loc]
-        clump_temp = data['stream_temp'][loc]
-
-        ab = data['ab_ratios'][i]
-        ac = data['ac_ratios'][i]
-        label_str = f"Stream {i+1} (a/b={ab:.1f}, a/c={ac:.1f})" if ab > 0 and ac > 0 else f"Stream {i+1} (a/b={ab:.1f})" if ab > 0 else f"Stream {i+1}"
-
+    # Use single scatter plot for large counts, individual plots for small counts
+    if data['count'] > 100:
         ax.scatter(
-            clump_dx[:, 0], clump_dx[:, 1], clump_dx[:, 2],
-            s=1.2, alpha=0.5, c=clump_temp,
+            dx[:, 0], dx[:, 1], dx[:, 2],
+            s=1.2, alpha=0.5, c=data['stream_temp'],
             cmap=cmap, norm=norm,
-            label=label_str, edgecolors='none', rasterized=True,
+            label=f"{data['count']} cold streams", edgecolors='none', rasterized=True,
         )
-
-    # 每条 Stream 分别绘制凸包包裹面
-    if show_hull:
+    else:
         for i in range(data['count']):
             loc = slice(data['offsets'][i], data['offsets'][i] + data['lengths'][i])
-            pts = dx[loc]
-            if len(pts) >= 4:
-                try:
-                    hull = ConvexHull(pts)
-                    ax.plot_trisurf(
-                        pts[:, 0], pts[:, 1], pts[:, 2],
-                        triangles=hull.simplices,
-                        color='lightblue',
-                        alpha=hull_alpha,
-                        edgecolor='lightblue',
-                        linewidth=0.5,
-                        linestyle='--',
-                        antialiased=True,
-                    )
-                except Exception:
-                    pass
+            clump_dx = dx[loc]
+            clump_temp = data['stream_temp'][loc]
+
+            ab = data['ab_ratios'][i]
+            ac = data['ac_ratios'][i]
+            label_str = f"Stream {i+1} (a/b={ab:.1f}, a/c={ac:.1f})" if ab > 0 and ac > 0 else f"Stream {i+1} (a/b={ab:.1f})" if ab > 0 else f"Stream {i+1}"
+
+            ax.scatter(
+                clump_dx[:, 0], clump_dx[:, 1], clump_dx[:, 2],
+                s=1.2, alpha=0.5, c=clump_temp,
+                cmap=cmap, norm=norm,
+                label=label_str, edgecolors='none', rasterized=True,
+            )
+
+        # Convex hull per stream (only for small counts)
+        if show_hull:
+            for i in range(data['count']):
+                loc = slice(data['offsets'][i], data['offsets'][i] + data['lengths'][i])
+                pts = dx[loc]
+                if len(pts) >= 4:
+                    try:
+                        hull = ConvexHull(pts)
+                        ax.plot_trisurf(
+                            pts[:, 0], pts[:, 1], pts[:, 2],
+                            triangles=hull.simplices,
+                            color='lightblue',
+                            alpha=hull_alpha,
+                            edgecolor='lightblue',
+                            linewidth=0.5,
+                            linestyle='--',
+                            antialiased=True,
+                        )
+                    except Exception:
+                        pass
 
     rvir = data['r200c']
     shells = [

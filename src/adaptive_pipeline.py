@@ -1,6 +1,5 @@
 import numpy as np
 from scipy import signal
-from scipy import ndimage
 import itertools
 import os
 import time
@@ -56,66 +55,6 @@ def find_plateau_1d(x_values, y_values):
     
     return float(x_values[best_mid_idx])
 
-def find_plateau_2d(X_grid, Y_grid, Z_counts):
-    """
-    2D plateau search algorithm.
-
-    Logic:
-    1. Apply lightweight 2D median filtering to smooth isolated noise points and prevent plateau fragmentation.
-    2. Find the connected domain with the largest Z_counts in 2D space (scipy.ndimage.label).
-    3. Apply distance transform (scipy.ndimage.distance_transform_edt) to that domain.
-    4. Find the pixel farthest from any boundary (the "safe center") and map it back to (X, Y) coordinates.
-    """
-    Z_counts = np.asarray(Z_counts)
-    
-    # Fallback: if all empty or zero, return grid center
-    if Z_counts.size == 0 or np.all(Z_counts == 0):
-        mid_y, mid_x = Z_counts.shape[0] // 2, Z_counts.shape[1] // 2
-        return float(X_grid[mid_y, mid_x]), float(Y_grid[mid_y, mid_x])
-        
-    # [Optimization] Use median filtering to smooth minor numerical fluctuations, improving morphological parameter search robustness
-    Z_smoothed = ndimage.median_filter(Z_counts, size=3)
-    
-    # Extract all unique non-zero count values
-    unique_counts = np.unique(Z_smoothed)
-    unique_counts = unique_counts[unique_counts > 0]
-    
-    max_area = 0
-    best_label_mask = None
-    
-    # 1. Iterate over all non-zero count values, find the largest contiguous iso-value “island”
-    for val in unique_counts:
-        # Generate binary mask for the current count value
-        binary_mask = (Z_smoothed == val)
-        
-        # Connected component analysis
-        labeled_array, num_features = ndimage.label(binary_mask)
-        
-        # Track the largest sub-component by area
-        for i in range(1, num_features + 1):
-            component_mask = (labeled_array == i)
-            area = np.sum(component_mask)
-            
-            if area > max_area:
-                max_area = area
-                best_label_mask = component_mask
-                
-    if best_label_mask is None:
-        mid_y, mid_x = Z_counts.shape[0] // 2, Z_counts.shape[1] // 2
-        return float(X_grid[mid_y, mid_x]), float(Y_grid[mid_y, mid_x])
-        
-    # 2. Apply Euclidean distance transform (EDT) to the largest connected domain
-    # Compute the distance from each interior pixel to the nearest background (boundary)
-    distance_map = ndimage.distance_transform_edt(best_label_mask)
-    
-    # 3. Find the safe center farthest from any boundary (max value in distance_map)
-    center_y, center_x = np.unravel_index(np.argmax(distance_map), distance_map.shape)
-    
-    best_X = X_grid[center_y, center_x]
-    best_Y = Y_grid[center_y, center_x]
-    
-    return float(best_X), float(best_Y)
-
 # =========================================================================
 # Pipeline Entrance: Main Pipeline Assembly
 # =========================================================================
@@ -123,8 +62,7 @@ def find_plateau_2d(X_grid, Y_grid, Z_counts):
 def adaptive_cold_stream_pipeline(subhalo_id, snapNum, catalogs, cutout_dir, output_dir):
     """
     Sequential multi-scale adaptive cold stream identification master pipeline.
-    Includes pre-processing, Phase 1 (topology scan), Phase 2 (merge scan),
-    Phase 3 (morphology scan), and final data I/O.
+    Includes pre-processing, Phase 1 (topology scan), Phase 2 (merge scan), and final data I/O.
     """
     saveFilename = os.path.join(output_dir, f"cold_streams_snap{snapNum:03d}_sh{subhalo_id}.hdf5")
 
@@ -248,48 +186,6 @@ def adaptive_cold_stream_pipeline(subhalo_id, snapNum, catalogs, cutout_dir, out
     if count <= 1:
         print(f"[{subhalo_id}] Phase 2 count <= 1, triggering short-circuit to IO.")
         return api.extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs, output_dir, snapNum)
-
-    # ---------------------------------------------------------------------
-    # Phase 3: Morphology (2D morphological filtering scan) [Decoupled & performance-optimized]
-    # ---------------------------------------------------------------------
-    print("\n--- Phase 3: Morphology Scanning ---")
-    # Build 2D grid of thresh_ab (X) and thresh_ac (Y) (e.g. 10x10 grid)
-    ab_vals = np.linspace(1.2, 2.0, 10)
-    ac_vals = np.linspace(2.0, 4.0, 10)
-    
-    # [Optimization] Explicitly set indexing='ij' to prevent axis flip on asymmetric grids
-    AB_grid, AC_grid = np.meshgrid(ab_vals, ac_vals, indexing='ij')
-    phase3_counts = np.zeros_like(AB_grid, dtype=int)
-    
-    # [Performance core optimization]: Pre-compute PCA morphology ratios for all fragments outside the loop, eliminating O(N^2) redundant computation
-    ratios_ab, ratios_ac = api.precompute_morphology_ratios(
-        gas_data, subhalo_info, identity, count, BoxSize
-    )
-    
-    for i in range(AB_grid.shape[0]):
-        for j in range(AB_grid.shape[1]):
-            # Lightweight mask comparison only; rapidly count surviving cold streams for the current parameter pair
-            ab_thresh = AB_grid[i, j]
-            ac_thresh = AC_grid[i, j]
-            
-            surviving_fragments = np.sum((ratios_ab > ab_thresh) & (ratios_ac > ac_thresh))
-            phase3_counts[i, j] = surviving_fragments
-            
-    best_ab, best_ac = find_plateau_2d(AB_grid, AC_grid, phase3_counts)
-    print(f"[{subhalo_id}] Phase 3 Locked Best Morphology -> ab: {best_ab:.2f}, ac: {best_ac:.2f}")
-
-    # Solidify final state: directly map surviving fragments using pre-computed ratios
-    # Avoid re-invoking filter_streams_morphology to skip redundant PCA computation
-    surviving_ids = np.where((ratios_ab > best_ab) & (ratios_ac > best_ac))[0]
-    new_count = len(surviving_ids)
-    print(f"[{subhalo_id}] Morphology filtering complete: retained {new_count} filament-like structures")
-
-    c_map = np.zeros(count, dtype=np.int32) - 1
-    if new_count > 0:
-        c_map[surviving_ids] = np.arange(new_count)
-    valid_mask = identity >= 0
-    identity[valid_mask] = c_map[identity[valid_mask]]
-    count = new_count
 
     # ---------------------------------------------------------------------
     # Final Step: Data I/O (Logging & IO)

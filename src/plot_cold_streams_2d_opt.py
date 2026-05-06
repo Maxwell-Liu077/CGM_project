@@ -25,14 +25,7 @@ from matplotlib.ticker import LogLocator, LogFormatterSciNotation
 import matplotlib.cm as cm
 from scipy.spatial import ConvexHull
 
-# ── 引入 Scientific Visualization Skill 的辅助模块 ──
-SKILL_DIR = os.path.expanduser("~/.claude/skills/scientific-visualization")
-sys.path.insert(0, os.path.join(SKILL_DIR, "scripts"))
-from style_presets import apply_publication_style
-from figure_export import save_publication_figure
-
-# ── 期刊级样式 ──
-apply_publication_style('default')
+# ── 期刊级样式 (自包含, 不依赖 skill) ──
 plt.rcParams['font.family'] = 'sans-serif'
 plt.rcParams['font.sans-serif'] = ['Arial', 'DejaVu Sans']
 plt.rcParams['image.cmap'] = 'magma'
@@ -248,7 +241,8 @@ def plot_cold_streams_2d(data, snapNum, subhalo_id, boxSize=35000.0,
     # 导出
     if save_path:
         base = os.path.splitext(save_path)[0]
-        save_publication_figure(fig, base, formats=['pdf', 'png'], dpi=300)
+        fig.savefig(base + ".pdf", dpi=300, bbox_inches="tight")
+        fig.savefig(base + ".png", dpi=300, bbox_inches="tight")
     else:
         plt.show()
 

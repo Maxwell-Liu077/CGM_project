@@ -190,6 +190,11 @@ def main():
         else:
             failed_subhalos.append(subhalo_id)
 
+        # Stop after first subhalo for testing
+        if index >= 1:
+            print("\n[Test mode] Stopping after first subhalo for inspection")
+            break
+
     print(f"\n{'='*60}")
     print("PROCESSING SUMMARY")
     print(f"{'='*60}")
