@@ -8,6 +8,21 @@ import h5py
 # Import core computational library
 import API_methods as api
 
+# Phase 2 fixed parameter
+MERGE_FRACTION_FIXED = 0.02
+
+# Phase 3 HDBSCAN parameters
+HDBSCAN_MIN_CLUSTER_SIZE = 3
+HDBSCAN_MIN_SAMPLES = 1
+
+# Phase 3 epsilon scan parameters
+EPS_COARSE_MIN = 0.02
+EPS_COARSE_MAX = 0.50
+EPS_COARSE_N = 8
+EPS_FINE_N = 10
+EPS_FINE_FRAC = 0.20
+CONVERGENCE_THRESHOLD = 10
+
 # =========================================================================
 # Utils: Platform Search Algorithms
 # =========================================================================
@@ -142,49 +157,44 @@ def adaptive_cold_stream_pipeline(subhalo_id, snapNum, catalogs, cutout_dir, out
         return api.extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs, output_dir, snapNum)
 
     # ---------------------------------------------------------------------
-    # Phase 2: Merging (fragment merge scan)
+    # Phase 2: Merging (fixed-parameter single pass)
     # ---------------------------------------------------------------------
-    print("\n--- Phase 2: Merging Scanning ---")
-    # Coarse scan across the full parameter range, then fine scan around the best value
-    merge_fracs_coarse = np.linspace(0.005, 0.05, 6)
-    phase2_counts_coarse = []
-    for frac in merge_fracs_coarse:
-        _, cnt = api.merge_fragmented_streams(
-            gas_data, subhalo_info, identity.copy(), count, BoxSize, merge_fraction=frac
-        )
-        phase2_counts_coarse.append(cnt)
-
-    best_merge_frac_coarse = find_plateau_1d(merge_fracs_coarse, phase2_counts_coarse)
-    if best_merge_frac_coarse is None:
-        best_merge_frac_coarse = 0.02
-        print(f"[{subhalo_id}] Phase 2 coarse scan returned no plateau, using default 0.020")
-    else:
-        print(f"[{subhalo_id}] Phase 2 Coarse Best merge_fraction: {best_merge_frac_coarse:.4f}")
-        # Fine scan: 8 points within ±20% of the coarse best value, clamped to [0.005, 0.05]
-        lo = max(0.005, best_merge_frac_coarse * 0.80)
-        hi = min(0.05, best_merge_frac_coarse * 1.20)
-        merge_fracs_fine = np.linspace(lo, hi, 8)
-        phase2_counts_fine = []
-        for frac in merge_fracs_fine:
-            _, cnt = api.merge_fragmented_streams(
-                gas_data, subhalo_info, identity.copy(), count, BoxSize, merge_fraction=frac
-            )
-            phase2_counts_fine.append(cnt)
-        best_merge_frac = find_plateau_1d(merge_fracs_fine, phase2_counts_fine)
-        if best_merge_frac is None:
-            best_merge_frac = best_merge_frac_coarse
-            print(f"[{subhalo_id}] Phase 2 fine scan returned no plateau, falling back to coarse: {best_merge_frac:.4f}")
-        else:
-            print(f"[{subhalo_id}] Phase 2 Locked Best merge_fraction: {best_merge_frac:.4f}")
-
-    # Solidify state
+    print("\n--- Phase 2: Merging (fixed parameter) ---")
     identity, count = api.merge_fragmented_streams(
-        gas_data, subhalo_info, identity, count, BoxSize, merge_fraction=best_merge_frac
+        gas_data, subhalo_info, identity, count, BoxSize,
+        merge_fraction=MERGE_FRACTION_FIXED
     )
-    
+    print(f"[{subhalo_id}] Phase 2 complete: {count} fragments remaining")
+
     # Short-circuit: skip remaining phases if count <= 1
     if count <= 1:
         print(f"[{subhalo_id}] Phase 2 count <= 1, triggering short-circuit to IO.")
+        return api.extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs, output_dir, snapNum)
+
+    # ---------------------------------------------------------------------
+    # Phase 3: 6D Phase-Space HDBSCAN Merging (adaptive epsilon)
+    # ---------------------------------------------------------------------
+    print("\n--- Phase 3: 6D Phase-Space HDBSCAN Merging ---")
+    identity, count = api.merge_streams_hdbscan(
+        gas_data,
+        subhalo_info,
+        identity,
+        count,
+        BoxSize,
+        v_vir=None,
+        min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+        min_samples=HDBSCAN_MIN_SAMPLES,
+        eps_coarse_min=EPS_COARSE_MIN,
+        eps_coarse_max=EPS_COARSE_MAX,
+        eps_coarseN=EPS_COARSE_N,
+        eps_fineN=EPS_FINE_N,
+        eps_fine_frac=EPS_FINE_FRAC,
+        convergence_threshold=CONVERGENCE_THRESHOLD,
+    )
+
+    # Short-circuit: skip remaining phases if count <= 1
+    if count <= 1:
+        print(f"[{subhalo_id}] Phase 3 count <= 1, triggering short-circuit to IO.")
         return api.extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs, output_dir, snapNum)
 
     # ---------------------------------------------------------------------

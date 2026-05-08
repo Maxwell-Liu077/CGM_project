@@ -9,6 +9,11 @@ from scipy.spatial import Delaunay
 from scipy.spatial import cKDTree
 from numba import jit
 
+try:
+    import hdbscan
+except ImportError:
+    hdbscan = None
+
 # =========================================================================
 # Core computation modules
 # =========================================================================
@@ -563,16 +568,210 @@ def extract_stream_properties(gas_data, subhalo_info, identity, count, catalogs,
 
     return objects, props
 
+def _select_plateau(x_values, y_values):
+    """Select the most stable x-value from a 1D scan via plateau detection."""
+    from scipy import signal
+    x_values = np.asarray(x_values)
+    y_values = np.asarray(y_values)
+    if len(x_values) < 3:
+        return float(x_values[len(x_values) // 2]) if len(x_values) > 0 else None
+    y_filtered = signal.medfilt(y_values, kernel_size=3)
+    segments = []
+    start_idx = 0
+    for val in y_filtered:
+        if not segments or segments[-1][2] != val:
+            segments.append([start_idx, 1, val])
+        else:
+            segments[-1][1] += 1
+        start_idx += 1
+    max_len = max(seg[1] for seg in segments)
+    candidates = [seg for seg in segments if seg[1] == max_len]
+    center_idx = len(x_values) / 2.0
+    best_segment = min(candidates, key=lambda seg: abs((seg[0] + seg[1] / 2.0) - center_idx))
+    best_mid_idx = int(best_segment[0] + best_segment[1] // 2)
+    return float(x_values[best_mid_idx])
+
 # =========================================================================
-# Main pipeline execution
+# HDBSCAN 6D phase-space merging (Phase 3)
 # =========================================================================
+
+def _build_hdbscan_features(gas_data, identity, count, BoxSize):
+    """Build 6D phase-space feature matrix for stream fragments."""
+    valid_mask = identity >= 0
+    valid_indices = np.where(valid_mask)[0]
+    pos = gas_data['Coordinates'][valid_indices]
+    vel = gas_data['PhysicalVelocity'][valid_indices]
+    mass = gas_data['Masses'][valid_indices]
+    local_identities = identity[valid_indices]
+
+    features = np.zeros((count, 6))
+    for i in range(count):
+        member = local_identities == i
+        member_pos = pos[member]
+        ref = member_pos[0]
+        dx = periodic_displacement(member_pos, ref, BoxSize)
+        features[i, :3] = (ref + dx.mean(axis=0)) % BoxSize
+        features[i, 3:] = np.average(vel[member], axis=0, weights=mass[member])
+
+    return features, valid_indices, local_identities
+
+def _scale_features(features, subhalo_info, v_vir=None):
+    """Normalize position by R200c, velocity by virial velocity."""
+    features_scaled = features.copy()
+    features_scaled[:, :3] /= subhalo_info['r200c']
+
+    if v_vir is None:
+        v_vir = calculate_virial_velocity(
+            subhalo_info['m_vir'],
+            subhalo_info['r200c'],
+            subhalo_info['a']
+        )
+    features_scaled[:, 3:] /= v_vir
+    return features_scaled, v_vir
+
+def _run_hdbscan_at_epsilon(features_scaled, count, epsilon, min_cluster_size=3, min_samples=1):
+    """Run HDBSCAN at a fixed epsilon, return (new_labels, n_components)."""
+    if hdbscan is None:
+        raise ImportError("hdbscan is required. Install with: pip install hdbscan")
+
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=min_cluster_size,
+        min_samples=min_samples,
+        cluster_selection_epsilon=epsilon,
+        metric='euclidean',
+        cluster_selection_method='eom',
+    )
+    labels = clusterer.fit_predict(features_scaled)
+
+    if count <= 1:
+        return np.arange(count, dtype=np.int32), count
+
+    new_labels = np.zeros(count, dtype=np.int32)
+    next_label = 0
+
+    noise_components = np.where(labels == -1)[0]
+    for comp_id in noise_components:
+        new_labels[comp_id] = next_label
+        next_label += 1
+
+    cluster_ids = sorted([l for l in set(labels) if l != -1])
+    for cluster_id in cluster_ids:
+        member_components = np.where(labels == cluster_id)[0]
+        for comp_id in member_components:
+            new_labels[comp_id] = next_label
+        next_label += 1
+
+    return new_labels, next_label
+
+def merge_streams_hdbscan(
+    gas_data,
+    subhalo_info,
+    identity,
+    count,
+    BoxSize,
+    v_vir=None,
+    min_cluster_size=3,
+    min_samples=1,
+    eps_coarse_min=0.02,
+    eps_coarse_max=0.50,
+    eps_coarseN=8,
+    eps_fineN=10,
+    eps_fine_frac=0.20,
+    convergence_threshold=10,
+):
+    """
+    Merge stream fragments using HDBSCAN in 6D phase space
+    with adaptive epsilon selection via coarse-to-fine plateau scanning.
+    """
+    if count <= 1:
+        return identity, count
+
+    print(f"[{subhalo_info['subhalo_id']}] Phase 3: HDBSCAN adaptive epsilon scan, initial components: {count}")
+
+    features, valid_indices, local_identities = _build_hdbscan_features(
+        gas_data, identity, count, BoxSize
+    )
+    features_scaled, v_vir = _scale_features(features, subhalo_info, v_vir)
+
+    # Coarse scan
+    eps_coarse = np.linspace(eps_coarse_min, eps_coarse_max, eps_coarseN)
+    counts_coarse = []
+    labels_list_coarse = []
+    for eps in eps_coarse:
+        lbls, cnt = _run_hdbscan_at_epsilon(
+            features_scaled, count, eps, min_cluster_size, min_samples
+        )
+        counts_coarse.append(cnt)
+        labels_list_coarse.append(lbls)
+
+    # Filter to convergence zone
+    conv_mask = [c <= convergence_threshold for c in counts_coarse]
+    if not any(conv_mask):
+        best_idx = int(np.argmin(counts_coarse))
+        best_eps = float(eps_coarse[best_idx])
+        best_labels = labels_list_coarse[best_idx]
+        best_count = counts_coarse[best_idx]
+        print(f"  [epsilon scan] No convergence (count<={convergence_threshold}) found; "
+              f"using min-count epsilon={best_eps:.3f} (count={best_count})")
+    else:
+        eps_conv = eps_coarse[conv_mask]
+        counts_conv = [c for c, m in zip(counts_coarse, conv_mask) if m]
+        labels_conv = [l for l, m in zip(labels_list_coarse, conv_mask) if m]
+
+        best_eps = _select_plateau(eps_conv, counts_conv)
+        if best_eps is None:
+            best_eps = float(eps_conv[len(eps_conv) // 2])
+
+        # Fine scan
+        lo = max(eps_coarse_min, best_eps * (1 - eps_fine_frac))
+        hi = min(eps_coarse_max, best_eps * (1 + eps_fine_frac))
+        eps_fine = np.linspace(lo, hi, eps_fineN)
+        counts_fine = []
+        labels_fine = []
+        for eps in eps_fine:
+            lbls, cnt = _run_hdbscan_at_epsilon(
+                features_scaled, count, eps, min_cluster_size, min_samples
+            )
+            counts_fine.append(cnt)
+            labels_fine.append(lbls)
+
+        conv_mask_fine = [c <= convergence_threshold for c in counts_fine]
+        if any(conv_mask_fine):
+            eps_fine_conv = eps_fine[conv_mask_fine]
+            counts_fine_conv = [c for c, m in zip(counts_fine, conv_mask_fine) if m]
+            labels_fine_conv = [l for l, m in zip(labels_fine, conv_mask_fine) if m]
+
+            best_eps_fine = _select_plateau(eps_fine_conv, counts_fine_conv)
+            if best_eps_fine is not None:
+                best_eps = best_eps_fine
+                idx = int(np.argmin(np.abs(eps_fine_conv - best_eps_fine)))
+                best_labels = labels_fine_conv[idx]
+                best_count = counts_fine_conv[idx]
+                print(f"  [epsilon scan] Locked epsilon={best_eps:.4f} (count={best_count})")
+            else:
+                best_idx = int(np.argmin(counts_fine_conv))
+                best_eps = float(eps_fine_conv[best_idx])
+                best_labels = labels_fine_conv[best_idx]
+                best_count = counts_fine_conv[best_idx]
+                print(f"  [epsilon scan] No fine plateau; using min-count epsilon={best_eps:.3f} (count={best_count})")
+        else:
+            best_idx = int(np.argmin(counts_fine))
+            best_eps = float(eps_fine[best_idx])
+            best_labels = labels_fine[best_idx]
+            best_count = counts_fine[best_idx]
+            print(f"  [epsilon scan] No fine convergence; using min-count epsilon={best_eps:.3f} (count={best_count})")
+
+    identity[valid_indices] = best_labels[local_identities]
+    print(f"[{subhalo_info['subhalo_id']}] Phase 3 complete: {count} fragments merged into {best_count} structures (epsilon={best_eps:.4f})")
+
+    return identity, best_count
 
 def analyze_cold_streams_pipeline(subhalo_id, snapNum, catalogs, 
                                   cutout_dir='/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_results/cutouts',
                                   output_dir='/public/home/zju_visitor/LiuYuanhao/cold_stream/simulation_results/streams',
                                   rmin_fac=0.15, 
                                   base_edge_tolerance=1.25, min_edge_tolerance=1.05, max_edge_tolerance=1.45,
-                                  merge_fraction=0.01, thresh_ab=1.5, thresh_ac=3.0): 
+                                  merge_fraction=0.01): 
     """Main pipeline for cold stream identification and analysis"""
     os.makedirs(output_dir, exist_ok=True)
     saveFilename = os.path.join(output_dir, f"cold_streams_snap{snapNum:03d}_sh{subhalo_id}.hdf5")
@@ -617,12 +816,6 @@ def analyze_cold_streams_pipeline(subhalo_id, snapNum, catalogs,
     identity, count = merge_fragmented_streams(
         gas_data, subhalo_info, identity, count, catalogs['BoxSize'], merge_fraction=merge_fraction
     )
-
-    if count > 0:
-        identity, count = filter_streams_morphology(
-            gas_data, subhalo_info, identity, count, catalogs['BoxSize'],
-            thresh_ab=thresh_ab, thresh_ac=thresh_ac
-        )
 
     objects, props = extract_stream_properties(
         gas_data, subhalo_info, identity, count, catalogs, output_dir, snapNum
