@@ -637,7 +637,7 @@ def _run_hdbscan_at_epsilon(features_scaled, count, epsilon, min_cluster_size=3,
     clusterer = hdbscan.HDBSCAN(
         min_cluster_size=min_cluster_size,
         min_samples=min_samples,
-        cluster_selection_epsilon=epsilon,
+        cluster_selection_epsilon=float(epsilon),
         metric='euclidean',
         cluster_selection_method='eom',
     )
